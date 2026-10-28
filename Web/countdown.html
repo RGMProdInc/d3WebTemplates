@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Playback Countdown Status</title>
+    <link rel="stylesheet" href="stylesheet_metadata_cue_colors.css" />
+
+    <script>
+      "use strict";
+
+      var fps = 30;
+
+      const SHOW_METADATA_ON_LOAD =
+        new URLSearchParams(window.location.search).get("metadata") === "1";
+
+      if (SHOW_METADATA_ON_LOAD) {
+        document.documentElement.classList.add("show-metadata");
+      }
+
+      const ELEMENT_IDS = {
+        BG_TRT: "BG_TRT",
+        BG_Remain: "BG_Remain",
+        BG_FileName: "BG_FileName",
+        CurrentCue: "currentCue",
+        SectionName: "sectionName",
+        NextSectionCue: "nextSectionCue",
+        NextSectionName: "nextSectionName",
+        HasAudio: "hasAudio",
+        HasAlpha: "hasAlpha",
+        AudioSampleRate: "audioSampleRate",
+        Codec: "codec"
+      };
+
+      const elements = {};
+      const pendingValues = {};
+
+      const getElement = (id) => {
+        if (!elements[id]) {
+          elements[id] = document.getElementById(id);
+        }
+        return elements[id];
+      };
+
+      const setText = (id, value) => {
+        const displayValue = value ?? "";
+        const element = getElement(id);
+
+        if (!element) {
+          pendingValues[id] = displayValue;
+          return;
+        }
+
+        element.textContent = displayValue;
+
+        if (id === ELEMENT_IDS.BG_FileName) {
+          element.title = displayValue;
+        }
+      };
+
+      const setYesNo = (id, value) => {
+        setText(id, Number(value) === 1 ? "Yes" : "No");
+      };
+
+      const setMetadataVisible = (isVisible) => {
+        const shouldShow = Number(isVisible) === 1 || isVisible === true;
+        document.documentElement.classList.toggle("show-metadata", shouldShow);
+
+        const metadataGrid = document.getElementById("metadataGrid");
+        if (metadataGrid) {
+          metadataGrid.setAttribute("aria-hidden", shouldShow ? "false" : "true");
+        }
+      };
+
+      const applyPendingValues = () => {
+        Object.entries(pendingValues).forEach(([id, value]) => {
+          const element = getElement(id);
+          if (!element) return;
+
+          element.textContent = value;
+
+          if (id === ELEMENT_IDS.BG_FileName) {
+            element.title = value;
+          }
+
+          delete pendingValues[id];
+        });
+      };
+
+      document.addEventListener("DOMContentLoaded", () => {
+        applyPendingValues();
+        setMetadataVisible(SHOW_METADATA_ON_LOAD);
+      });
+
+      var d3 = {
+        BG_TRT: (value) => setText(ELEMENT_IDS.BG_TRT, value),
+        BG_Remain: (value) => setText(ELEMENT_IDS.BG_Remain, value),
+        BG_FileName: (value) => setText(ELEMENT_IDS.BG_FileName, value),
+        CurrentCue: (value) => setText(ELEMENT_IDS.CurrentCue, value),
+        SectionName: (value) => setText(ELEMENT_IDS.SectionName, value),
+        NextSectionCue: (value) => setText(ELEMENT_IDS.NextSectionCue, value),
+        NextSectionName: (value) => setText(ELEMENT_IDS.NextSectionName, value),
+        HasAudio: (value) => setYesNo(ELEMENT_IDS.HasAudio, value),
+        HasAlpha: (value) => setYesNo(ELEMENT_IDS.HasAlpha, value),
+        AudioSampleRate: (value) => setText(ELEMENT_IDS.AudioSampleRate, value),
+        Codec: (value) => setText(ELEMENT_IDS.Codec, value),
+        ShowMetadata: (value) => setMetadataVisible(value)
+      };
+    </script>
+  </head>
+
+  <body>
+    <main class="dashboard" aria-label="Playback countdown status">
+      <header class="file-strip" aria-label="Current file">
+        <p class="file-strip__label">File</p>
+        <p id="BG_FileName" class="file-strip__name" title="No File">No File</p>
+      </header>
+
+      <section class="primary-grid" aria-label="Primary timing and cue information">
+        <article class="status-card">
+          <h1 class="status-card__label">TRT</h1>
+          <p id="BG_TRT" class="status-card__value">0</p>
+        </article>
+
+        <article class="status-card status-card--remaining">
+          <h1 class="status-card__label">Remaining</h1>
+          <p id="BG_Remain" class="status-card__value">0</p>
+        </article>
+
+        <article class="status-card">
+          <h1 class="status-card__label">Current Cue</h1>
+          <p id="currentCue" class="status-card__value"></p>
+        </article>
+
+        <article class="status-card">
+          <h1 class="status-card__label">Next Cue</h1>
+          <p id="nextSectionCue" class="status-card__value"></p>
+        </article>
+      </section>
+
+      <section class="name-grid" aria-label="Cue names">
+        <article class="name-card">
+          <h2 class="name-card__label">Current Name</h2>
+          <p id="sectionName" class="name-card__value"></p>
+        </article>
+
+        <article class="name-card">
+          <h2 class="name-card__label">Next Name</h2>
+          <p id="nextSectionName" class="name-card__value"></p>
+        </article>
+      </section>
+
+      <section id="metadataGrid" class="metadata-grid" aria-label="Technical metadata" aria-hidden="true">
+        <article class="metadata-card">
+          <h2 class="metadata-card__label">Alpha</h2>
+          <p id="hasAlpha" class="metadata-card__value"></p>
+        </article>
+
+        <article class="metadata-card">
+          <h2 class="metadata-card__label">Audio</h2>
+          <p id="hasAudio" class="metadata-card__value"></p>
+        </article>
+
+        <article class="metadata-card">
+          <h2 class="metadata-card__label">Audio Rate</h2>
+          <p id="audioSampleRate" class="metadata-card__value"></p>
+        </article>
+
+        <article class="metadata-card">
+          <h2 class="metadata-card__label">Codec</h2>
+          <p id="codec" class="metadata-card__value"></p>
+        </article>
+      </section>
+    </main>
+  </body>
+</html>

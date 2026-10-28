@@ -1,0 +1,866 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Loop Counter</title>
+
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        overflow: hidden;
+      }
+
+      #debug {
+        display: none;
+        box-sizing: border-box;
+        width: 100vw;
+        height: 100vh;
+        padding: 16px;
+        background: rgba(10, 12, 16, 0.92);
+        color: #d8dee9;
+        font: 14px/1.4 Consolas, "Courier New", monospace;
+      }
+
+      .show-debug #debug {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        grid-template-rows: auto auto 1fr;
+        gap: 12px;
+      }
+
+      #debugProbe {
+        grid-column: 1 / -1;
+      }
+
+      #debug h2 {
+        margin: 0 0 6px;
+        font-size: 13px;
+        color: #88c0d0;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+
+      #debug table {
+        border-collapse: collapse;
+        width: 100%;
+      }
+
+      #debug td {
+        padding: 1px 8px 1px 0;
+        vertical-align: top;
+        word-break: break-all;
+      }
+
+      #debug td:first-child {
+        color: #81a1c1;
+        white-space: nowrap;
+        width: 1%;
+      }
+
+      #debugLog {
+        grid-column: 1 / -1;
+        overflow: hidden;
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-all;
+        font-size: 12px;
+      }
+
+      .ok { color: #a3be8c; }
+      .bad { color: #bf616a; }
+      .warn { color: #ebcb8b; }
+    </style>
+
+    <script>
+      "use strict";
+
+      // Loops a video layer LoopCount times, then flips its "at end point"
+      // keyframe from LOOP to PAUSE via the Live Update websocket. The original
+      // value is restored when the counter resets: stop, backwards jump, the
+      // playhead leaving the layer (e.g. next section), or a change to
+      // LoopCount / ModuleName.
+      //
+      // Web layer custom parameters (function name -> value):
+      //   ModuleName   string   looping layer name as shown on the timeline, e.g. "v1" (searched for among the
+      //                         active track's layers), or a full object path, e.g. getByUID(0x...)
+      //   DirectorHost string   "host:port" of the Director, e.g. "192.168.10.10:80"
+      //   LoopCount    numeric  total number of plays before pausing
+      //   CurrentFrame numeric  expression for the looping layer's current frame
+      //   LoopEndFrame numeric  expression for module:<name>.clipLoopEndFrame
+      //   IsDirector   numeric  1 = this instance sends Live Update commands
+      //   ShowDebug    numeric  1 = show the troubleshooting panel (or load the page with ?debug=1).
+      //                         Hidden, the page renders nothing and runs no diagnostic subscriptions.
+      //
+      // The web layer must extend past the end of the video layer so it can
+      // restore at end point after the playhead moves on.
+
+      const AT_END_FIELD = "at end point";
+      const AT_END_VALUES = { LOOP: 0.0, PING_PONG: 1.0, PAUSE: 2.0 };
+
+      // Frames from the loop end that count as "reached the end".
+      const END_TOLERANCE_FRAMES = 2;
+      const RECONNECT_DELAY_MS = 2000;
+      // status can blip to "stopped" (e.g. while a keyframe edit lands), so a
+      // stop only resets the counter if it lasts this long.
+      const STOP_RESET_DELAY_MS = 1000;
+      // Live Update update rates. Every subscription is a Python evaluation on
+      // the Director, so these are kept as slow as the job allows.
+      const OVERRIDE_UPDATE_MS = 250;
+      const EXTENTS_UPDATE_MS = 1000;
+      const PROBE_UPDATE_MS = 1000;
+      // Designer answered a burst of back-to-back subscribes with
+      // "Invalid JSON" and dropped one, so outgoing messages are spaced out.
+      const SEND_INTERVAL_MS = 25;
+      // A restore keeps its subscription until the restored value is seen
+      // (or this long), so the set isn't dropped by an immediate unsubscribe.
+      const RESTORE_CONFIRM_MS = 3000;
+      const DEBUG_RENDER_MS = 250;
+      const DEBUG_LOG_LINES = 40;
+      const DEBUG_LINE_MAX = 240; // full text is still in the browser console
+      const LOG_PREFIX = "[loopCounter]";
+
+      const params = {
+        moduleName: "",
+        directorHost: "",
+        loopCount: 0,
+        currentFrame: null,
+        loopEndFrame: 0,
+        isDirector: false,
+        showDebug: new URLSearchParams(window.location.search).get("debug") === "1",
+        status: "stopped",
+        globalTime: 0,
+        bpm: 120
+      };
+
+      const counter = {
+        completedPlays: 0,
+        endLatched: false,
+        lastFrame: null,
+        pauseRequested: false
+      };
+
+      // Playhead position relative to the looping layer, from its extents
+      // (read on the Director) and globalTime. Works after the layer is no
+      // longer under the playhead, as long as the web layer still is.
+      const layer = {
+        extents: null, // { tStart, tEnd }
+        active: null // true | false | null (unknown: counting isn't gated)
+      };
+
+      const debug = {
+        lines: [],
+        renderTimer: null,
+        lastSent: null,
+        lastError: null,
+        lastReset: null,
+        lastRestore: null
+      };
+
+      let stopResetTimer = null;
+
+      // ---------------------------------------------------------------------
+      // Logging
+      // ---------------------------------------------------------------------
+
+      const stamp = () => new Date().toISOString().slice(11, 23);
+
+      // Events only (never per frame), so buffering while hidden is cheap and
+      // the log is already filled in when the panel is shown.
+      const pushDebug = (level, args) => {
+        let text = args
+          .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
+          .join(" ");
+        if (text.length > DEBUG_LINE_MAX) text = `${text.slice(0, DEBUG_LINE_MAX)}…`;
+        debug.lines.unshift({ level, text: `${stamp()} ${text}` });
+        if (debug.lines.length > DEBUG_LOG_LINES) debug.lines.length = DEBUG_LOG_LINES;
+        scheduleDebugRender();
+      };
+
+      const log = (...args) => {
+        if (params.showDebug) console.log(LOG_PREFIX, ...args);
+        pushDebug("", args);
+      };
+      const warn = (...args) => {
+        console.warn(LOG_PREFIX, ...args);
+        pushDebug("bad", args);
+      };
+
+      // ---------------------------------------------------------------------
+      // Live Update expressions
+      // ---------------------------------------------------------------------
+
+      const escapeLiteral = (value) => String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+      // Designer can't resolve a layer by name as an object path (module:<name>
+      // and layer:"<name>" both fail). As in CueForge's tally watch, bind to an
+      // object that always resolves and find the layer in the property expression,
+      // with track.findLayerByName() on the active transports' tracks
+      // (Track.getLeafLayers() needs a type argument, so it can't be used bare).
+      // A full object path (getByUID(0x...) or track:...) is used directly instead.
+      const ALWAYS_RESOLVES_OBJECT = "subsystem:MonitoringManager";
+      const ACTIVE_TRANSPORTS_EXPR =
+        "(list(getattr(LocalState.localOrDirectorState().transport, 'transportManagers', None) or []) " +
+        "or [LocalState.localOrDirectorState().transport])";
+      const T_NOW_EXPR = `float(${ACTIVE_TRANSPORTS_EXPR}[0].player.tCurrent)`;
+
+      const isObjectPath = (moduleName) =>
+        moduleName.includes(":") || moduleName.startsWith("getByUID(");
+
+      const objectPathFor = (moduleName) =>
+        isObjectPath(moduleName) ? moduleName : ALWAYS_RESOLVES_OBJECT;
+
+      const layerExprFor = (moduleName) =>
+        isObjectPath(moduleName)
+          ? "object"
+          : `[l for l in [tm.track.findLayerByName("${escapeLiteral(moduleName)}") ` +
+            `for tm in ${ACTIVE_TRANSPORTS_EXPR}] if l][0]`;
+
+      const atEndSeqExpr = (moduleName) =>
+        `${layerExprFor(moduleName)}.findSequence("${AT_END_FIELD}").sequence`;
+
+      // Key active at track time t, frozen into the path so the subscription
+      // keeps pointing at the same key for set and restore. Keyframe times share
+      // player.tCurrent's units, which is what globalTime reports.
+      // Ends in a plain .key(i).v so a Live Update set can assign to it.
+      const atEndKeyPath = (moduleName, t) => {
+        const seq = atEndSeqExpr(moduleName);
+        return `${seq}.key(max(0, ${seq}.find(${t.toFixed(4)}))).v`;
+      };
+
+      const extentsExpr = (moduleName) => {
+        const l = layerExprFor(moduleName);
+        return `[${l}.tStart, ${l}.tEnd]`;
+      };
+
+      // Each step of the lookup as its own subscription, so a failure points
+      // at the step that broke. Only subscribed while the debug panel is shown.
+      const probeExpressions = (moduleName) => {
+        const seq = atEndSeqExpr(moduleName);
+        const keyNow = `${seq}.key(max(0, ${seq}.find(${T_NOW_EXPR})))`;
+        const probes = {
+          "transports": `len(${ACTIVE_TRANSPORTS_EXPR})`,
+          "d3 tCurrent": T_NOW_EXPR,
+          "track layers": `[str(l.name) for tm in ${ACTIVE_TRANSPORTS_EXPR} for l in tm.track.layers]`,
+          "layer found": `str(${layerExprFor(moduleName)})`,
+          "at end keys": `${seq}.nKeys()`,
+          "key index now": `${seq}.find(${T_NOW_EXPR})`,
+          "key type": `type(${keyNow}).__name__`,
+          "key .v now": `${keyNow}.v`
+        };
+        if (isObjectPath(moduleName)) delete probes["track layers"];
+        return probes;
+      };
+
+      // ---------------------------------------------------------------------
+      // Live Update websocket
+      // ---------------------------------------------------------------------
+
+      const live = {
+        socket: null,
+        url: "",
+        reconnectTimer: null,
+        sendQueue: [],
+        sendTimer: null,
+        // Subscription registry. An entry is { path, id, onValue }; ids arrive
+        // later in a "subscriptions" message and are matched by property path.
+        byPath: new Map(),
+        byId: new Map(),
+        // Subscriptions dropped before the server returned their id.
+        cancelledPaths: new Set(),
+        // { entry, originalValue, liveValue, unreadable }
+        override: null,
+        // Restores waiting for confirmation: [{ entry, value, timer }]
+        restoring: [],
+        extents: null, // registry entry
+        probe: null // { entries: {label: entry}, values: {label: value} }
+      };
+
+      const isOpen = () => live.socket !== null && live.socket.readyState === WebSocket.OPEN;
+
+      const send = (message) => {
+        if (!isOpen()) {
+          warn("Live Update not connected; dropped", message);
+          return false;
+        }
+        live.sendQueue.push(message);
+        flushSendQueue();
+        return true;
+      };
+
+      const flushSendQueue = () => {
+        if (live.sendTimer || live.sendQueue.length === 0) return;
+        if (!isOpen()) {
+          live.sendQueue = [];
+          return;
+        }
+
+        const message = live.sendQueue.shift();
+        live.socket.send(JSON.stringify(message));
+        debug.lastSent = message;
+        pushDebug("warn", ["->", message]);
+
+        live.sendTimer = setTimeout(() => {
+          live.sendTimer = null;
+          flushSendQueue();
+        }, SEND_INTERVAL_MS);
+      };
+
+      const subscribe = (path, updateFrequencyMs, onValue) => {
+        if (!send({
+          subscribe: {
+            object: objectPathFor(params.moduleName),
+            properties: [path],
+            configuration: { updateFrequencyMs }
+          }
+        })) return null;
+
+        const entry = { path, id: null, onValue };
+        live.byPath.set(path, entry);
+        return entry;
+      };
+
+      const unsubscribe = (entry) => {
+        if (!entry || live.byPath.get(entry.path) !== entry) return;
+        live.byPath.delete(entry.path);
+        if (entry.id !== null) {
+          live.byId.delete(entry.id);
+          if (isOpen()) send({ unsubscribe: { id: entry.id } });
+        } else {
+          live.cancelledPaths.add(entry.path);
+        }
+      };
+
+      const handleLiveMessage = (event) => {
+        let message;
+        try {
+          message = JSON.parse(event.data);
+        } catch (err) {
+          warn("Unparseable Live Update message", event.data);
+          return;
+        }
+
+        if (message.error) {
+          debug.lastError = message.error;
+          // Errors don't say which request failed; the last one sent is the best hint.
+          warn("Live Update error:", message.error, "- last sent:", debug.lastSent);
+          return;
+        }
+
+        if (Array.isArray(message.subscriptions)) {
+          if (params.showDebug) pushDebug("ok", ["<-", `subscriptions (${message.subscriptions.length})`]);
+          message.subscriptions.forEach((sub) => {
+            if (live.cancelledPaths.delete(sub.propertyPath)) {
+              send({ unsubscribe: { id: sub.id } });
+              return;
+            }
+            const entry = live.byPath.get(sub.propertyPath);
+            if (entry && entry.id === null) {
+              entry.id = sub.id;
+              live.byId.set(sub.id, entry);
+            }
+          });
+        }
+
+        if (Array.isArray(message.valuesChanged)) {
+          message.valuesChanged.forEach((change) => {
+            const entry = live.byId.get(change.id);
+            if (entry) entry.onValue(change.value, change);
+          });
+        }
+      };
+
+      const connectLive = () => {
+        clearTimeout(live.reconnectTimer);
+
+        if (!params.isDirector || !params.directorHost) {
+          disconnectLive();
+          return;
+        }
+
+        const url = `ws://${params.directorHost}/api/session/liveupdate`;
+        if (live.socket && live.url === url) return;
+
+        disconnectLive();
+        live.url = url;
+
+        try {
+          live.socket = new WebSocket(url);
+        } catch (err) {
+          warn("WebSocket failed to open", url, err);
+          scheduleReconnect();
+          return;
+        }
+
+        live.socket.addEventListener("open", () => {
+          log("Live Update connected", url);
+          live.cancelledPaths.clear();
+          subscribeExtents();
+          subscribeProbe();
+          if (live.override) {
+            // Resubscribe so the override can still be restored.
+            live.override.entry = subscribe(live.override.entry.path, OVERRIDE_UPDATE_MS, onOverrideValue);
+          } else if (counter.pauseRequested) {
+            requestPause();
+          }
+        });
+        live.socket.addEventListener("message", handleLiveMessage);
+        live.socket.addEventListener("close", (event) => {
+          warn(`Live Update closed ${url} (code ${event.code}${event.reason ? `, ${event.reason}` : ""})`);
+          live.socket = null;
+          clearTimeout(live.sendTimer);
+          live.sendTimer = null;
+          live.sendQueue = [];
+          // Subscriptions die with the socket; the keyframe edit itself persists.
+          live.byPath.clear();
+          live.byId.clear();
+          live.extents = null;
+          live.probe = null;
+          live.restoring.forEach((pending) => {
+            clearTimeout(pending.timer);
+            warn(`Restore to ${pending.value} unconfirmed - socket closed. Check the layer.`);
+            debug.lastRestore = `${stamp()} unconfirmed (socket closed)`;
+          });
+          live.restoring = [];
+          scheduleReconnect();
+        });
+        live.socket.addEventListener("error", () => warn("Live Update socket error", url));
+      };
+
+      const disconnectLive = () => {
+        clearTimeout(live.reconnectTimer);
+        if (live.socket) {
+          const socket = live.socket;
+          live.socket = null;
+          live.url = "";
+          socket.close();
+        }
+      };
+
+      const scheduleReconnect = () => {
+        clearTimeout(live.reconnectTimer);
+        if (!params.isDirector || !params.directorHost) return;
+        live.reconnectTimer = setTimeout(() => {
+          live.url = "";
+          connectLive();
+        }, RECONNECT_DELAY_MS);
+      };
+
+      // ---------------------------------------------------------------------
+      // Layer extents / probe
+      // ---------------------------------------------------------------------
+
+      const subscribeExtents = () => {
+        unsubscribe(live.extents);
+        live.extents = null;
+        layer.extents = null;
+        updateLayerActive();
+        if (!params.isDirector || !params.moduleName || !isOpen()) return;
+
+        live.extents = subscribe(extentsExpr(params.moduleName), EXTENTS_UPDATE_MS, (value) => {
+          const valid = Array.isArray(value) && value.length === 2 &&
+            Number.isFinite(Number(value[0])) && Number.isFinite(Number(value[1]));
+          if (!valid) {
+            if (layer.extents) warn("Layer extents unreadable:", value);
+            layer.extents = null;
+          } else {
+            layer.extents = { tStart: Number(value[0]), tEnd: Number(value[1]) };
+          }
+          updateLayerActive();
+        });
+      };
+
+      const unsubscribeProbe = () => {
+        const probe = live.probe;
+        live.probe = null;
+        if (probe) Object.values(probe.entries).forEach(unsubscribe);
+      };
+
+      const subscribeProbe = () => {
+        unsubscribeProbe();
+        if (!params.showDebug || !params.isDirector || !params.moduleName || !isOpen()) return;
+
+        const probe = { entries: {}, values: {} };
+        Object.entries(probeExpressions(params.moduleName)).forEach(([label, path]) => {
+          // One subscribe per probe so a failing step doesn't take the others down.
+          probe.entries[label] = subscribe(path, PROBE_UPDATE_MS, (value) => {
+            probe.values[label] = value;
+            scheduleDebugRender();
+          });
+        });
+        live.probe = probe;
+      };
+
+      // Leaving the layer (e.g. going to the next section) restores
+      // at end point even though the layer is no longer under the playhead.
+      const updateLayerActive = () => {
+        const e = layer.extents;
+        const active = e ? e.tStart <= params.globalTime && params.globalTime < e.tEnd : null;
+        if (active === layer.active) return;
+
+        const wasActive = layer.active;
+        layer.active = active;
+        scheduleDebugRender();
+        if (active === null) return;
+
+        log(`Playhead ${active ? "entered" : "left"} layer ${params.moduleName}`);
+        if (!active && wasActive !== null) {
+          resetCounter(`playhead left layer ${params.moduleName}`);
+        } else if (active) {
+          counter.lastFrame = null; // start counting fresh on entry
+        }
+      };
+
+      // ---------------------------------------------------------------------
+      // Pause / restore
+      // ---------------------------------------------------------------------
+
+      function onOverrideValue(value, change) {
+        const override = live.override;
+        if (!override) return;
+
+        override.liveValue = Number(value);
+        scheduleDebugRender();
+        if (override.originalValue !== null || override.unreadable) return;
+
+        log("First value for at end point key (raw):", change);
+        const original = Number(value);
+        if (value === null || typeof value === "object" || !Number.isFinite(original)) {
+          // Don't write to a key we couldn't read; see the Probe section.
+          override.unreadable = true;
+          warn("At end point key value is not a number - PAUSE not sent. Show debug to see Probe values.");
+          return;
+        }
+
+        override.originalValue = original;
+        log("Captured original at end point value:", original);
+
+        if (original !== AT_END_VALUES.PAUSE) {
+          send({ set: [{ id: override.entry.id, value: AT_END_VALUES.PAUSE }] });
+          log("Set at end point -> PAUSE");
+        }
+      }
+
+      const requestPause = () => {
+        counter.pauseRequested = true;
+        if (!params.isDirector || !params.moduleName || live.override) return;
+
+        const path = atEndKeyPath(params.moduleName, params.globalTime);
+        const entry = subscribe(path, OVERRIDE_UPDATE_MS, onOverrideValue);
+        if (!entry) {
+          connectLive(); // requestPause runs again on open
+          return;
+        }
+        live.override = { entry, originalValue: null, liveValue: null, unreadable: false };
+        log("Subscribed at end point key", path);
+      };
+
+      const restoreOriginal = () => {
+        const override = live.override;
+        live.override = null;
+        if (!override) return;
+
+        const { entry, originalValue } = override;
+        if (entry.id === null || originalValue === null || originalValue === AT_END_VALUES.PAUSE) {
+          unsubscribe(entry);
+          return;
+        }
+
+        if (!send({ set: [{ id: entry.id, value: originalValue }] })) {
+          warn(`Restore to ${originalValue} not sent - Live Update not connected`);
+          debug.lastRestore = `${stamp()} NOT SENT (not connected)`;
+          unsubscribe(entry);
+          return;
+        }
+        log("Restoring at end point ->", originalValue);
+        debug.lastRestore = `${stamp()} sent ${atEndName(originalValue)}, waiting`;
+
+        const pending = { entry, value: originalValue, timer: null };
+        entry.onValue = (value) => {
+          if (Number(value) === pending.value) finishRestore(pending, true);
+        };
+        pending.timer = setTimeout(() => finishRestore(pending, false), RESTORE_CONFIRM_MS);
+        live.restoring.push(pending);
+      };
+
+      function finishRestore(pending, confirmed) {
+        clearTimeout(pending.timer);
+        live.restoring = live.restoring.filter((p) => p !== pending);
+        if (confirmed) {
+          log("Restore confirmed: at end point =", pending.value);
+          debug.lastRestore = `${stamp()} confirmed ${atEndName(pending.value)}`;
+        } else {
+          warn(`Restore to ${pending.value} not confirmed within ${RESTORE_CONFIRM_MS} ms`);
+          debug.lastRestore = `${stamp()} NOT confirmed`;
+        }
+        unsubscribe(pending.entry);
+        scheduleDebugRender();
+      }
+
+      // ---------------------------------------------------------------------
+      // Counting
+      // ---------------------------------------------------------------------
+
+      const resetCounter = (reason) => {
+        if (counter.pauseRequested || counter.completedPlays > 0) log("Reset:", reason);
+        debug.lastReset = `${stamp()} ${reason}`;
+        restoreOriginal();
+        counter.completedPlays = 0;
+        counter.endLatched = false;
+        counter.pauseRequested = false;
+        counter.lastFrame = null;
+        scheduleDebugRender();
+      };
+
+      // PAUSE has to be in place before the final play reaches the loop end,
+      // so it is requested as the final play begins: after the wraparound out
+      // of the previous play (endLatched cleared), not when that play's end is
+      // first seen, or the previous play would be the one that pauses.
+      const checkLimit = () => {
+        const limit = Math.max(1, params.loopCount);
+        if (!counter.pauseRequested && !counter.endLatched && counter.completedPlays >= limit - 1) {
+          log(`Play ${counter.completedPlays + 1} of ${limit} - arming PAUSE`);
+          requestPause();
+        }
+      };
+
+      const onFrame = (frame) => {
+        const playing = params.status === "playing";
+
+        // Checked in every status, so a cue back while stopped or holding
+        // still resets (and restores) instead of being absorbed.
+        if (counter.lastFrame !== null && frame < counter.lastFrame) {
+          const finished = counter.pauseRequested && counter.completedPlays >= params.loopCount;
+          if (playing && counter.endLatched && !finished) {
+            counter.endLatched = false; // normal loop wraparound
+          } else {
+            resetCounter(playing ? "playhead jumped backwards" : `cued backwards while ${params.status}`);
+          }
+        }
+
+        // An inactive layer's frame expression may hold its last value, which
+        // must not be counted as plays.
+        if (!playing || layer.active === false || params.loopCount <= 0 || !params.moduleName) {
+          counter.lastFrame = frame;
+          scheduleDebugRender();
+          return;
+        }
+
+        const endFrame = Math.round(params.loopEndFrame);
+        if (!counter.endLatched && endFrame > 0 && frame >= endFrame - END_TOLERANCE_FRAMES) {
+          counter.endLatched = true;
+          counter.completedPlays += 1;
+          log(`Reached loop end (${endFrame}) - completed plays: ${counter.completedPlays}`);
+        }
+
+        checkLimit();
+        counter.lastFrame = frame;
+        scheduleDebugRender();
+      };
+
+      // ---------------------------------------------------------------------
+      // Debug panel (ShowDebug = 1 or ?debug=1)
+      // ---------------------------------------------------------------------
+
+      const SOCKET_STATES = ["CONNECTING", "OPEN", "CLOSING", "CLOSED"];
+      const AT_END_NAMES = { 0: "LOOP", 1: "PING-PONG", 2: "PAUSE" };
+
+      const esc = (value) =>
+        String(value).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+
+      const cell = (value, cls = "") =>
+        `<span class="${cls}">${esc(value === null || value === undefined || value === "" ? "—" : value)}</span>`;
+
+      const rows = (pairs) =>
+        `<table>${pairs.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${v}</td></tr>`).join("")}</table>`;
+
+      const atEndName = (v) =>
+        v === null || v === undefined ? null : `${v} (${AT_END_NAMES[v] ?? "?"})`;
+
+      const layerActiveCell = () => {
+        if (!params.isDirector) return cell("not tracked (IsDirector=0)", "warn");
+        const e = layer.extents;
+        if (!e) return cell("waiting for layer extents", "warn");
+        const range = `${e.tStart} – ${e.tEnd}`;
+        return layer.active
+          ? cell(`yes (${range})`, "ok")
+          : cell(`no, not counting (${range})`, "warn");
+      };
+
+      const probeRows = () => {
+        const p = live.probe;
+        if (!p) return [["probe", cell("inactive (needs IsDirector=1, ModuleName, open websocket)", "warn")]];
+        return Object.entries(p.entries).map(([label, entry]) => {
+          if (!entry || entry.id === null) return [label, cell("subscribing (or failed - see log)", "warn")];
+          if (!(label in p.values)) return [label, cell("waiting")];
+          const v = p.values[label];
+          const isError = v === null || (typeof v === "object" && v !== null && "errorType" in v);
+          return [label, cell(typeof v === "string" ? v : JSON.stringify(v), isError ? "bad" : "ok")];
+        });
+      };
+
+      function renderDebug() {
+        debug.renderTimer = null;
+        if (!params.showDebug) return;
+
+        const inputs = document.getElementById("debugInputs");
+        const state = document.getElementById("debugState");
+        const probe = document.getElementById("debugProbe");
+        const logEl = document.getElementById("debugLog");
+        if (!inputs || !state || !probe || !logEl) return;
+
+        const limit = Math.max(1, params.loopCount);
+        const endFrame = Math.round(params.loopEndFrame);
+        const socketState = live.socket ? SOCKET_STATES[live.socket.readyState] : "NOT CONNECTED";
+        const o = live.override;
+
+        inputs.innerHTML = `<h2>Inputs</h2>` + rows([
+          ["ModuleName", cell(params.moduleName, params.moduleName ? "ok" : "bad")],
+          ["  object path", cell(params.moduleName && objectPathFor(params.moduleName))],
+          ["DirectorHost", cell(params.directorHost, params.directorHost ? "ok" : "warn")],
+          ["IsDirector", cell(params.isDirector ? "1 (sends commands)" : "0 (count only)", params.isDirector ? "ok" : "warn")],
+          ["LoopCount", cell(params.loopCount, params.loopCount > 0 ? "ok" : "bad")],
+          ["CurrentFrame", cell(params.currentFrame, params.currentFrame === null ? "bad" : "")],
+          ["LoopEndFrame", cell(endFrame, endFrame > 0 ? "ok" : "bad")],
+          ["status", cell(params.status, params.status === "playing" ? "ok" : "warn")],
+          ["globalTime", cell(params.globalTime.toFixed(3))],
+          ["bpm", cell(params.bpm)]
+        ]);
+
+        state.innerHTML = `<h2>Counter / Live Update</h2>` + rows([
+          ["completed plays", cell(`${counter.completedPlays} / ${limit}`)],
+          ["current play", cell(Math.min(counter.completedPlays + 1, limit))],
+          ["end latched", cell(counter.endLatched)],
+          ["last frame", cell(counter.lastFrame)],
+          ["pause requested", cell(counter.pauseRequested, counter.pauseRequested ? "warn" : "")],
+          ["playhead in layer", layerActiveCell()],
+          ["websocket", cell(`${socketState} ${live.url}`, socketState === "OPEN" ? "ok" : "bad")],
+          ["subscription id", cell(o ? o.entry.id ?? "pending" : null)],
+          ["key path", cell(o && o.entry.path)],
+          ["original value", o && o.unreadable
+            ? cell("unreadable - PAUSE not sent", "bad")
+            : cell(o && atEndName(o.originalValue))],
+          ["live value", cell(o && atEndName(o.liveValue), o && o.liveValue === AT_END_VALUES.PAUSE ? "warn" : "")],
+          ["last reset", cell(debug.lastReset)],
+          ["last restore", cell(debug.lastRestore,
+            !debug.lastRestore ? "" : debug.lastRestore.includes("confirmed ") ? "ok" : "bad")],
+          ["last error", cell(debug.lastError, debug.lastError ? "bad" : "")]
+        ]);
+
+        probe.innerHTML = `<h2>Probe (Director side, ${PROBE_UPDATE_MS} ms)</h2>` + rows(probeRows());
+
+        logEl.innerHTML = debug.lines
+          .map((l) => `<span class="${l.level}">${esc(l.text)}</span>`)
+          .join("\n");
+      }
+
+      // Throttled, and a no-op while hidden, so nothing is rendered per frame.
+      function scheduleDebugRender() {
+        if (!params.showDebug || debug.renderTimer) return;
+        debug.renderTimer = setTimeout(renderDebug, DEBUG_RENDER_MS);
+      }
+
+      const setDebugVisible = (show) => {
+        if (show === params.showDebug) return;
+        params.showDebug = show;
+        document.documentElement.classList.toggle("show-debug", show);
+        if (show) {
+          subscribeProbe();
+          scheduleDebugRender();
+        } else {
+          unsubscribeProbe();
+        }
+      };
+
+      if (params.showDebug) {
+        document.documentElement.classList.add("show-debug");
+        document.addEventListener("DOMContentLoaded", scheduleDebugRender);
+      }
+
+      window.addEventListener("beforeunload", () => {
+        restoreOriginal();
+        disconnectLive();
+      });
+
+      // ---------------------------------------------------------------------
+      // d3 entry points. Called every frame, so each returns early when the
+      // value hasn't changed.
+      // ---------------------------------------------------------------------
+
+      var d3 = {
+        ModuleName: (value) => {
+          const name = String(value ?? "").trim();
+          if (name === params.moduleName) return;
+          resetCounter("module name changed");
+          params.moduleName = name;
+          subscribeExtents();
+          subscribeProbe();
+        },
+        DirectorHost: (value) => {
+          const host = String(value ?? "").trim();
+          if (host === params.directorHost) return;
+          params.directorHost = host;
+          connectLive();
+        },
+        LoopCount: (value) => {
+          const count = Math.round(Number(value) || 0);
+          if (count === params.loopCount) return;
+          resetCounter("loop count changed");
+          params.loopCount = count;
+        },
+        CurrentFrame: (value) => {
+          const frame = Math.round(Number(value));
+          if (Number.isNaN(frame) || frame === params.currentFrame) return;
+          params.currentFrame = frame;
+          onFrame(frame);
+        },
+        LoopEndFrame: (value) => {
+          params.loopEndFrame = Number(value) || 0;
+        },
+        IsDirector: (value) => {
+          const isDirector = Number(value) === 1 || value === true;
+          if (isDirector === params.isDirector) return;
+          params.isDirector = isDirector;
+          connectLive();
+          subscribeExtents();
+          subscribeProbe();
+        },
+        ShowDebug: (value) => setDebugVisible(Number(value) === 1 || value === true),
+
+        // Standard web layer functions.
+        status: (value) => {
+          if (value === params.status) return;
+          log(`status ${params.status} -> ${value}`);
+          params.status = value;
+          clearTimeout(stopResetTimer);
+          if (value === "stopped") {
+            stopResetTimer = setTimeout(() => {
+              if (params.status === "stopped") resetCounter("playhead stopped");
+            }, STOP_RESET_DELAY_MS);
+          }
+        },
+        globalTime: (value) => {
+          const t = Number(value) || 0;
+          if (t === params.globalTime) return;
+          params.globalTime = t;
+          if (layer.extents) updateLayerActive();
+        },
+        bpm: (value) => {
+          params.bpm = Number(value) || params.bpm;
+        }
+      };
+    </script>
+  </head>
+
+  <body>
+    <main id="debug" aria-label="Loop counter debug">
+      <section id="debugInputs"></section>
+      <section id="debugState"></section>
+      <section id="debugProbe"></section>
+      <pre id="debugLog"></pre>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,194 @@
+:root {
+  --page-bg: #141414;
+  --panel-bg: #1f1f1f;
+  --panel-border: #3b3b3b;
+  --metadata-hidden-bg: #000;
+  --label-color: goldenrod;
+  --primary-text: rgb(236, 236, 236);
+  --value-text: lightcyan;
+  --current-cue-text: #02aa45;
+  --next-cue-text: #0e64b9;
+  --shadow: 3px 5px 10px black;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+}
+
+body {
+  color: var(--primary-text);
+  font-family: "Din Pro Bold", Verdana, Arial, Geneva, "Arial Black", sans-serif;
+  font-weight: normal;
+  background: var(--page-bg);
+  overflow: hidden;
+}
+
+.dashboard {
+  width: 100vw;
+  height: 100vh;
+  padding: 36px 48px 40px;
+  display: grid;
+  grid-template-rows: 150px 1fr 180px 120px;
+  gap: 24px;
+}
+
+.file-strip {
+  min-width: 0;
+  display: grid;
+  grid-template-rows: 34px 1fr;
+  align-items: center;
+  border-bottom: 2px solid var(--panel-border);
+}
+
+.file-strip__label {
+  color: var(--label-color);
+  font-size: 1.5rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.file-strip__name {
+  min-width: 0;
+  width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 5rem;
+  line-height: 1;
+  font-style: italic;
+  font-weight: 500;
+  text-shadow: var(--shadow);
+}
+
+.primary-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+}
+
+.status-card,
+.name-card,
+.metadata-card {
+  min-width: 0;
+  overflow: hidden;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 18px;
+}
+
+.status-card {
+  display: grid;
+  grid-template-rows: 56px 1fr;
+  padding: 24px 32px;
+}
+
+.status-card__label,
+.name-card__label,
+.metadata-card__label {
+  color: var(--label-color);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.status-card__label {
+  font-size: 2.25rem;
+}
+
+.status-card__value {
+  min-width: 0;
+  align-self: center;
+  color: var(--value-text);
+  font-size: 7rem;
+  line-height: 0.95;
+  font-variant-numeric: tabular-nums;
+  text-shadow: var(--shadow);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#currentCue {
+  color: var(--current-cue-text);
+}
+
+#nextSectionCue {
+  color: var(--next-cue-text);
+}
+
+.status-card--remaining .status-card__value {
+  font-size: 8rem;
+}
+
+.name-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+}
+
+.name-card {
+  display: grid;
+  grid-template-rows: 44px 1fr;
+  padding: 20px 28px;
+}
+
+.name-card__label {
+  font-size: 1.65rem;
+}
+
+.name-card__value {
+  color: var(--value-text);
+  font-size: 3.75rem;
+  line-height: 1.05;
+  text-shadow: var(--shadow);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.metadata-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px;
+  background: var(--metadata-hidden-bg);
+  border-radius: 18px;
+}
+
+.metadata-card {
+  display: grid;
+  grid-template-rows: 34px 1fr;
+  padding: 16px 22px;
+  visibility: hidden;
+}
+
+html.show-metadata .metadata-card {
+  visibility: visible;
+}
+
+.metadata-card__label {
+  font-size: 1.25rem;
+}
+
+.metadata-card__value {
+  min-width: 0;
+  align-self: center;
+  color: var(--value-text);
+  font-size: 2.5rem;
+  line-height: 1;
+  text-shadow: var(--shadow);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
